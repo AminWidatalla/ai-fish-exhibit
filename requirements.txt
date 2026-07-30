@@ -1,0 +1,10 @@
+opencv-python
+numpy
+qrcode
+Pillow
+flask
+flask-socketio
+pyttsx3
+openai canceled
+python-dotenv
+groq
