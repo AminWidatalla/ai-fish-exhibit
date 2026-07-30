@@ -190,7 +190,8 @@ def ask_ai_and_speak(question: str) -> None:
     # ---- 3d. Initialise TTS engine -----------------------------------------
     engine = pyttsx3.init()
     engine.setProperty("rate", int(words_per_minute))
-
+    engine.setProperty("voice", "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\TTS_MS_EN-US_DAVID_11.0")
+    print("DEBUG - Current voice:", engine.getProperty("voice"))
     def on_word_start(name, location, length):
         """
         Called by pyttsx3 each time a new word begins.
