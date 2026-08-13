@@ -120,7 +120,7 @@ def get_video_frame(cap: cv2.VideoCapture) -> np.ndarray:
 # 3. AI & VOICE THREAD ENGINE
 # ----------------------------
 
-def ask_ai_and_speak(question: str) -> None:
+def ask_ai_and_speak(question: str, language: str) -> None:
     """
     1. Call Groq for an answer.
     2. Speak the answer with pyttsx3.
@@ -137,6 +137,16 @@ def ask_ai_and_speak(question: str) -> None:
     try:
         client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
+        language_names = {
+    "en": "English",
+    "tr": "Turkish",
+    "fr": "French",
+    "es": "Spanish",
+    "ar": "Arabic"
+    }
+
+        selected_language = language_names.get(language, "English")
+
         messages = [
             {
                 "role": "system",
@@ -148,6 +158,7 @@ def ask_ai_and_speak(question: str) -> None:
                     "Keep answers under 3 short sentences. "
                     "NEVER say you are an AI, a language model, or from OpenAI. "
                     "If asked 'who are you', say you are the ancient fish of this museum."
+                    f"Always answer the visitor in {selected_language}. "
                 ),
             },
         ]
@@ -260,6 +271,17 @@ HTML_TEMPLATE = """
             height: 20px; 
             transition: height 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
         }
+
+        #language-select {
+    width: 100%;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.2);
+    font-size: 16px;
+    background: rgba(0,0,0,0.6);
+    color: #fff;
+}
+
         #question-input:focus { 
             height: 100px; 
             outline: none; border-color: #c9a050; 
@@ -280,12 +302,23 @@ HTML_TEMPLATE = """
     <div id="video-container"><img id="stream-image" src="" alt="Connecting..."></div>
     
     <div id="chat-container">
-        <textarea id="question-input" placeholder="Tap to type your question..."></textarea>
-        <div class="input-row">
-            <button class="btn" id="mic-btn" title="Tap to speak">🎤</button>
-            <button class="btn" id="send-btn">Ask Question</button>
-        </div>
+
+    <select id="language-select">
+        <option value="en" selected>English</option>
+        <option value="tr">Turkish</option>
+        <option value="fr">French</option>
+        <option value="es">Spanish</option>
+        <option value="ar">Arabic</option>
+    </select>
+
+    <textarea id="question-input" placeholder="Tap to type your question..."></textarea>
+
+    <div class="input-row">
+        <button class="btn" id="mic-btn" title="Tap to speak">🎤</button>
+        <button class="btn" id="send-btn">Ask Question</button>
     </div>
+
+</div>
 
     <script>
         const socket = io();
@@ -293,13 +326,17 @@ HTML_TEMPLATE = """
         const input  = document.getElementById('question-input');
         const btn    = document.getElementById('send-btn');
         const mic    = document.getElementById('mic-btn');
+        const languageSelect = document.getElementById('language-select');
 
         socket.on('update_image', function(data) { img.src = data.image; });
 
         function sendQuestion(text) {
             const question = (typeof text === 'string') ? text.trim() : input.value.trim();
             if (question !== "") {
-                socket.emit('ask_question', { question: question });
+                socket.emit('ask_question', {
+    question: question,
+    language: languageSelect.value
+});
                 input.value = "";
                 input.blur();
             }
@@ -352,13 +389,21 @@ def handle_question(data):
 
     if current_state == STATE_IDLE:
         question = data['question']
-        threading.Thread(target=ask_ai_and_speak, args=(question,), daemon=True).start()
+        language = data.get('language', 'en')
+
+        threading.Thread(
+            target=ask_ai_and_speak,
+            args=(question, language),
+            daemon=True
+        ).start()
 
 
 threading.Thread(
     target=lambda: socketio.run(
-        app, host='0.0.0.0', port=8080,
-        ssl_context='adhoc', allow_unsafe_werkzeug=True
+        app,
+        host='0.0.0.0',
+        port=8080,
+        allow_unsafe_werkzeug=True
     ),
     daemon=True
 ).start()
@@ -380,7 +425,7 @@ def get_local_ip() -> str:
 
 
 LOCAL_IP   = get_local_ip()
-SERVER_URL = f"https://{LOCAL_IP}:8080"
+SERVER_URL = f"http://{LOCAL_IP}:8080"
 
 qr_pil   = qrcode.make(SERVER_URL).convert('RGB')
 qr_image = cv2.cvtColor(np.array(qr_pil), cv2.COLOR_RGB2BGR)
