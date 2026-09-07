@@ -1,5 +1,4 @@
 import cv2
-import os
 import numpy as np
 import time
 import socket
@@ -7,18 +6,26 @@ import threading
 import qrcode
 import base64
 import sys
+import os
 from pathlib import Path
+from dotenv import load_dotenv
 from flask import Flask, render_template_string
 from flask_socketio import SocketIO
 
 import pyttsx3
-from groq import Groq
-from dotenv import load_dotenv
-load_dotenv()
+from openai import OpenAI
 
 # ----------------------------
 # 1. SETTINGS & CONFIGURATION
 # ----------------------------
+# Load environment variables from .env file
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY not found. Please create a .env file with OPENAI_API_KEY=your_key")
+
 W, H = 1280, 720
 VIDEO_H = H
 
@@ -26,37 +33,29 @@ BASE_DIR = Path(getattr(sys, 'frozen', False) and getattr(sys, '_MEIPASS', Path.
 IMAGE_FOLDER = BASE_DIR / "images"
 STREAM_FPS = 15
 
-
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-# CONVERSATION STATES
+# ---------------------------------------------------------------------------
+# CONVERSATION STATES & HISTORY
+# ---------------------------------------------------------------------------
 STATE_IDLE     = "idle"
 STATE_THINKING = "thinking"
 STATE_TALKING  = "talking"
 
-current_state        = STATE_IDLE
-last_interaction_time = 0       # Used to decide when to show/hide the QR code
-interaction_text     = ""
-conversation_history   = []       # List of (question, answer) tuples for context
-MAX_HISTORY_MESSAGES = 6       # Keep the last 3 Q&A pairs
+current_state         = STATE_IDLE
+last_interaction_time = 0        # Used to decide when to show/hide the QR code
+interaction_text      = ""
+
+# Rolling conversation history (keeps last 6 messages)
+conversation_history = []
+MAX_HISTORY = 6
 
 # ---------------------------------------------------------------------------
-# VOICE / VIDEO SYNC — core idea
-# ---------------------------------------------------------------------------
-# `last_word_time` is updated every time pyttsx3 fires a 'started-word' event.
-# The display loop uses it to decide whether speech is "actively happening"
-# right now.  A grace window of SPEECH_PAUSE_GRACE seconds is applied so that
-# brief natural pauses between sentences (commas, full-stops) do NOT freeze the
-# video — only real gaps longer than the grace window pause the video frame.
-# The video NEVER goes back to the static image while STATE_TALKING is active.
-# It only returns to the static image once ask_ai_and_speak() sets STATE_IDLE.
+# VOICE / VIDEO SYNC
 # ---------------------------------------------------------------------------
 SPEECH_PAUSE_GRACE = 0.6        # seconds — tune this to your TTS rhythm
 
-last_word_time      = 0.0       # timestamp of the most recent 'started-word' event
+last_word_time      = 0.0        # timestamp of the most recent 'started-word' event
 speech_lock         = threading.Lock()
 
-# The display loop saves the last rendered video frame here so it can freeze on
-# it during a pause instead of calling get_video_frame() (which would advance).
 current_video_frame: np.ndarray | None = None
 
 
@@ -84,7 +83,6 @@ def _make_fallback_frame(text: str) -> np.ndarray:
     return frame
 
 
-# Load the static image shown when the fish is idle / thinking
 if TATTOO_IMAGE_PATH.exists():
     tattoo_image = cv2.imread(str(TATTOO_IMAGE_PATH))
     if tattoo_image is not None:
@@ -96,10 +94,7 @@ else:
 
 
 def get_video_frame(cap: cv2.VideoCapture) -> np.ndarray:
-    """
-    Read the next frame from *cap*, looping back to the start on exhaustion.
-    Always returns a frame sized to (W, H).
-    """
+    """Read next frame from cap, looping back on end."""
     ret, frame = cap.read()
     if not ret:
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -108,7 +103,6 @@ def get_video_frame(cap: cv2.VideoCapture) -> np.ndarray:
     if ret:
         return cv2.resize(frame, (W, H))
 
-    # Video file missing / unreadable
     fallback = np.zeros((H, W, 3), dtype=np.uint8)
     fallback[:] = (50, 20, 20)
     cv2.putText(fallback, "VIDEO NOT FOUND", (W // 2 - 200, H // 2),
@@ -120,119 +114,85 @@ def get_video_frame(cap: cv2.VideoCapture) -> np.ndarray:
 # 3. AI & VOICE THREAD ENGINE
 # ----------------------------
 
-def ask_ai_and_speak(question: str, language: str) -> None:
+def ask_ai_and_speak(question: str, language_name: str = "English") -> None:
     """
-    1. Call Groq for an answer.
-    2. Speak the answer with pyttsx3.
-    3. Keep STATE_TALKING alive for at least the estimated speech duration so
-       the display loop never flips back to the static image mid-sentence.
-    4. Only set STATE_IDLE once everything is truly finished.
+    1. Call OpenAI for an answer in the selected language.
+    2. Speak the answer using pyttsx3.
+    3. Hold talking state until speech completes.
     """
-    global current_state, interaction_text, last_word_time
+    global current_state, interaction_text, last_word_time, conversation_history
 
     current_state    = STATE_THINKING
     interaction_text = "..."
 
-    # ---- 3a. Fetch AI answer ------------------------------------------------
+    # System prompt enforcing language and persona constraints
+    system_prompt = (
+        "You are a magical, ancient fish in a bowl. "
+        "A human woman is standing beside you. "
+        "The user talking to you will expect the human to answer, "
+        "but YOU (the fish) are the one talking. You must surprise them. "
+        "Keep answers under 3 short sentences. "
+        "NEVER say you are an AI, a language model, or from OpenAI. "
+        "If asked 'who are you', say you are the ancient fish of this museum. "
+        f"CRITICAL: Respond exclusively in {language_name}."
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(conversation_history)
+    messages.append({"role": "user", "content": question})
+
     try:
-        client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-
-        language_names = {
-    "en": "English",
-    "tr": "Turkish",
-    "fr": "French",
-    "es": "Spanish",
-    "ar": "Arabic"
-    }
-
-        selected_language = language_names.get(language, "English")
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a magical, ancient fish in a bowl. "
-                    "A human woman is standing beside you. "
-                    "The user talking to you will expect the human to answer, "
-                    "but YOU (the fish) are the one talking. You must surprise them. "
-                    "Keep answers under 3 short sentences. "
-                    "NEVER say you are an AI, a language model, or from OpenAI. "
-                    "If asked 'who are you', say you are the ancient fish of this museum."
-                    f"Always answer the visitor in {selected_language}. "
-                ),
-            },
-        ]
-        messages.extend(conversation_history)
-        messages.append({"role": "user", "content": question})
-
+        client   = OpenAI(api_key=OPENAI_API_KEY)
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="gpt-4o-mini",
             messages=messages,
         )
         answer = response.choices[0].message.content
-
-        conversation_history.append({"role": "user", "content": question})
-        conversation_history.append({"role": "assistant", "content": answer})
-
-        if len(conversation_history) > MAX_HISTORY_MESSAGES:
-            conversation_history[:] = conversation_history[-MAX_HISTORY_MESSAGES:]
-
     except Exception as exc:
         print(f"OpenAI Error: {exc}")
         answer = "Bloop! My connection to the ocean is interrupted."
 
     interaction_text = answer
 
-    # ---- 3b. Estimate total speech duration ---------------------------------
-    word_count       = len(answer.split())
-    words_per_minute = 160.0
-    # Add a small buffer so the fish mouth-video doesn't cut off before the
-    # final word has fully played out.
+    # Update conversation history
+    conversation_history.append({"role": "user", "content": question})
+    conversation_history.append({"role": "assistant", "content": answer})
+    if len(conversation_history) > MAX_HISTORY:
+        conversation_history = conversation_history[-MAX_HISTORY:]
+
+    # Estimate speech duration
+    word_count        = len(answer.split())
+    words_per_minute  = 160.0
     expected_duration = (word_count / words_per_minute) * 60.0 + 0.5
 
-    # ---- 3c. Start video immediately, before the first word plays ----------
-    # Seed last_word_time NOW so the display loop sees speech as "active"
-    # from the very first frame.
     with speech_lock:
         last_word_time = time.time()
 
     current_state = STATE_TALKING
 
-    # ---- 3d. Initialise TTS engine -----------------------------------------
     engine = pyttsx3.init()
     engine.setProperty("rate", int(words_per_minute))
-    engine.setProperty("voice", "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\TTS_MS_EN-US_DAVID_11.0")
-    print("DEBUG - Current voice:", engine.getProperty("voice"))
+
     def on_word_start(name, location, length):
-        """
-        Called by pyttsx3 each time a new word begins.
-        Refreshing last_word_time keeps is_speech_active() returning True
-        for the duration of real speech.  The display loop will freeze the
-        video frame only when this timestamp goes stale beyond SPEECH_PAUSE_GRACE.
-        """
         global last_word_time
         with speech_lock:
             last_word_time = time.time()
 
     engine.connect("started-word", on_word_start)
 
-    # ---- 3e. Speak ----------------------------------------------------------
     speech_start = time.time()
-    engine.say(answer)
-    engine.runAndWait()
+    try:
+        engine.say(answer)
+        engine.runAndWait()
+    except Exception as tts_err:
+        print(f"TTS Error: {tts_err}")
 
-    # ---- 3f. Hold STATE_TALKING for the full estimated duration -------------
-    # Even after runAndWait() returns, we might be slightly under the expected
-    # duration due to timing jitter.  Keep the state alive so the video doesn't
-    # snap back to the static image before the audio has truly finished.
     elapsed = time.time() - speech_start
     if elapsed < expected_duration:
         time.sleep(expected_duration - elapsed)
 
-    # ---- 3g. Return to idle -------------------------------------------------
     current_state    = STATE_IDLE
     interaction_text = ""
-    # Zero out last_word_time so is_speech_active() returns False immediately.
     with speech_lock:
         last_word_time = 0.0
 
@@ -264,6 +224,11 @@ HTML_TEMPLATE = """
         
         .input-row { display: flex; gap: 10px; width: 100%; box-sizing: border-box; }
 
+        #language-select {
+            padding: 8px; border-radius: 6px; background: rgba(0,0,0,0.8); color: #c9a050;
+            border: 1px solid #c9a050; font-size: 14px; margin-bottom: 5px;
+        }
+
         #question-input {
             flex: 1; padding: 15px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2);
             font-size: 16px; background: rgba(0,0,0,0.6); color: #fff;
@@ -271,17 +236,6 @@ HTML_TEMPLATE = """
             height: 20px; 
             transition: height 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
         }
-
-        #language-select {
-    width: 100%;
-    padding: 12px;
-    border-radius: 8px;
-    border: 1px solid rgba(255,255,255,0.2);
-    font-size: 16px;
-    background: rgba(0,0,0,0.6);
-    color: #fff;
-}
-
         #question-input:focus { 
             height: 100px; 
             outline: none; border-color: #c9a050; 
@@ -302,45 +256,47 @@ HTML_TEMPLATE = """
     <div id="video-container"><img id="stream-image" src="" alt="Connecting..."></div>
     
     <div id="chat-container">
-
-    <select id="language-select">
-        <option value="en" selected>English</option>
-        <option value="tr">Turkish</option>
-        <option value="fr">French</option>
-        <option value="es">Spanish</option>
-        <option value="ar">Arabic</option>
-    </select>
-
-    <textarea id="question-input" placeholder="Tap to type your question..."></textarea>
-
-    <div class="input-row">
-        <button class="btn" id="mic-btn" title="Tap to speak">🎤</button>
-        <button class="btn" id="send-btn">Ask Question</button>
+        <select id="language-select">
+            <option value="en-US|English">English</option>
+            <option value="es-ES|Spanish">Español</option>
+            <option value="fr-FR|French">Français</option>
+            <option value="de-DE|German">Deutsch</option>
+            <option value="tr-TR|Turkish">Türkçe</option>
+            <option value="ar-SA|Arabic">العربية</option>
+            <option value="zh-CN|Mandarin">中文</option>
+        </select>
+        <textarea id="question-input" placeholder="Tap to type your question..."></textarea>
+        <div class="input-row">
+            <button class="btn" id="mic-btn" title="Tap to speak">🎤</button>
+            <button class="btn" id="send-btn">Ask Question</button>
+        </div>
     </div>
 
-</div>
-
     <script>
-        const socket = io();
-        const img    = document.getElementById('stream-image');
-        const input  = document.getElementById('question-input');
-        const btn    = document.getElementById('send-btn');
-        const mic    = document.getElementById('mic-btn');
-        const languageSelect = document.getElementById('language-select');
+        const socket   = io();
+        const img      = document.getElementById('stream-image');
+        const input    = document.getElementById('question-input');
+        const btn      = document.getElementById('send-btn');
+        const mic      = document.getElementById('mic-btn');
+        const langSel  = document.getElementById('language-select');
 
         socket.on('update_image', function(data) { img.src = data.image; });
+
+        function getSelectedLang() {
+            const parts = langSel.value.split('|');
+            return { code: parts[0], name: parts[1] };
+        }
 
         function sendQuestion(text) {
             const question = (typeof text === 'string') ? text.trim() : input.value.trim();
             if (question !== "") {
-                socket.emit('ask_question', {
-    question: question,
-    language: languageSelect.value
-});
+                const lang = getSelectedLang();
+                socket.emit('ask_question', { question: question, language_name: lang.name });
                 input.value = "";
                 input.blur();
             }
         }
+
         btn.addEventListener('click', () => sendQuestion());
         input.addEventListener('keypress', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
@@ -353,16 +309,22 @@ HTML_TEMPLATE = """
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         if (SpeechRecognition) {
             const recognition = new SpeechRecognition();
-            recognition.lang            = 'en-US';
-            recognition.interimResults  = false;
-            recognition.onstart  = () => { recognizing = true;  mic.textContent = '🔴'; };
-            recognition.onend    = () => { recognizing = false; mic.textContent = '🎤'; };
+            recognition.interimResults = false;
+
+            recognition.onstart = () => { recognizing = true; mic.textContent = '🔴'; };
+            recognition.onend   = () => { recognizing = false; mic.textContent = '🎤'; };
             recognition.onresult = (event) => {
                 const transcript = event.results[0][0].transcript || '';
                 if (transcript) sendQuestion(transcript);
             };
+
             mic.addEventListener('click', () => {
-                if (recognizing) { recognition.stop(); } else { recognition.start(); }
+                if (recognizing) {
+                    recognition.stop();
+                } else {
+                    recognition.lang = getSelectedLang().code;
+                    recognition.start();
+                }
             });
         }
     </script>
@@ -388,22 +350,19 @@ def handle_question(data):
     last_interaction_time = time.time()
 
     if current_state == STATE_IDLE:
-        question = data['question']
-        language = data.get('language', 'en')
-
+        question = data.get('question', '')
+        language_name = data.get('language_name', 'English')
         threading.Thread(
-            target=ask_ai_and_speak,
-            args=(question, language),
+            target=ask_ai_and_speak, 
+            args=(question, language_name), 
             daemon=True
         ).start()
 
 
 threading.Thread(
     target=lambda: socketio.run(
-        app,
-        host='0.0.0.0',
-        port=8080,
-        allow_unsafe_werkzeug=True
+        app, host='0.0.0.0', port=8080,
+        ssl_context='adhoc', allow_unsafe_werkzeug=True
     ),
     daemon=True
 ).start()
@@ -425,7 +384,7 @@ def get_local_ip() -> str:
 
 
 LOCAL_IP   = get_local_ip()
-SERVER_URL = f"http://{LOCAL_IP}:8080"
+SERVER_URL = f"https://{LOCAL_IP}:8080"
 
 qr_pil   = qrcode.make(SERVER_URL).convert('RGB')
 qr_image = cv2.cvtColor(np.array(qr_pil), cv2.COLOR_RGB2BGR)
@@ -440,47 +399,28 @@ print(f"System Ready. Connect phone to: {SERVER_URL}")
 while True:
     current_time = time.time()
 
-    # ------------------------------------------------------------------
-    # VISUAL STATE MACHINE
-    # ------------------------------------------------------------------
-    # • IDLE / THINKING  → always show static tattoo image
-    # • TALKING          → show fish video
-    #     - is_speech_active() == True  → advance video (mouth moving)
-    #     - is_speech_active() == False → freeze on last frame (mouth paused)
-    #   The video NEVER goes back to the static image while STATE_TALKING.
-    #   It only returns to the static image when STATE_IDLE is set by the
-    #   voice thread after the full speech duration has elapsed.
-    # ------------------------------------------------------------------
-
     if current_state in (STATE_IDLE, STATE_THINKING):
         display_frame       = tattoo_image.copy()
-        current_video_frame = None          # forget the frozen frame
+        current_video_frame = None
 
     else:  # STATE_TALKING
         if is_speech_active():
-            # Mouth moving — advance the video by reading the next frame
             new_frame           = get_video_frame(cap_idle)
             current_video_frame = new_frame.copy()
             display_frame       = new_frame
         else:
-            # Natural pause in speech — freeze on the last frame we had.
-            # If for some reason we don't have one yet, grab one now.
             if current_video_frame is None:
                 current_video_frame = get_video_frame(cap_idle)
             display_frame = current_video_frame.copy()
 
     local_frame = display_frame.copy()
 
-    # ------------------------------------------------------------------
-    # QR CODE — show when idle for 20+ seconds
-    # ------------------------------------------------------------------
+    # Show QR code after 20 seconds idle
     if (current_time - last_interaction_time) > 20:
         display_frame[20:170, 20:170] = qr_image
         local_frame[20:170, 20:170]   = qr_image
 
-    # ------------------------------------------------------------------
-    # STREAM TO MOBILE APP
-    # ------------------------------------------------------------------
+    # Stream frame to connected mobile clients
     if current_time - last_emit_time > (1.0 / STREAM_FPS):
         small_display  = cv2.resize(display_frame, (640, 360))
         _, img_encoded = cv2.imencode('.jpg', small_display, [cv2.IMWRITE_JPEG_QUALITY, 55])
@@ -488,9 +428,7 @@ while True:
         socketio.emit('update_image', {'image': f'data:image/jpeg;base64,{img_base64}'})
         last_emit_time = current_time
 
-    # ------------------------------------------------------------------
-    # LOCAL DISPLAY (monitor attached to the exhibit machine)
-    # ------------------------------------------------------------------
+    # Local Monitor Display
     cv2.imshow("Interactive Exhibit", local_frame)
     if cv2.waitKey(1) & 0xFF == 27:   # ESC to quit
         break
