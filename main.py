@@ -7,6 +7,8 @@ import qrcode
 import base64
 import sys
 import os
+import platform
+import subprocess
 from pathlib import Path
 from dotenv import load_dotenv
 from flask import Flask, render_template_string
@@ -18,7 +20,6 @@ from openai import OpenAI
 # ----------------------------
 # 1. SETTINGS & CONFIGURATION
 # ----------------------------
-# Load environment variables from .env file
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -41,28 +42,38 @@ STATE_THINKING = "thinking"
 STATE_TALKING  = "talking"
 
 current_state         = STATE_IDLE
-last_interaction_time = 0        # Used to decide when to show/hide the QR code
+last_interaction_time = 0
 interaction_text      = ""
 
-# Rolling conversation history (keeps last 6 messages)
 conversation_history = []
 MAX_HISTORY = 6
 
 # ---------------------------------------------------------------------------
-# VOICE / VIDEO SYNC
+# VOICE ENGINE & VIDEO SYNC (CROSS-PLATFORM)
 # ---------------------------------------------------------------------------
-SPEECH_PAUSE_GRACE = 0.6        # seconds — tune this to your TTS rhythm
-
-last_word_time      = 0.0        # timestamp of the most recent 'started-word' event
+SPEECH_PAUSE_GRACE = 0.6
+last_word_time      = 0.0
 speech_lock         = threading.Lock()
 
 current_video_frame: np.ndarray | None = None
+system_os = platform.system()
 
 
 def is_speech_active() -> bool:
     """Return True if a word was spoken recently enough to consider TTS active."""
     with speech_lock:
         return (time.time() - last_word_time) < SPEECH_PAUSE_GRACE
+
+
+def _speak_windows_threaded(text: str) -> None:
+    """Run TTS on Windows in an isolated thread to prevent driver lockups."""
+    try:
+        temp_engine = pyttsx3.init('sapi5')
+        temp_engine.setProperty("rate", 160)
+        temp_engine.say(text)
+        temp_engine.runAndWait()
+    except Exception as e:
+        print(f"Windows TTS Thread Error: {e}")
 
 
 # ----------------------------
@@ -73,9 +84,13 @@ IDLE_VIDEO_PATH   = IMAGE_FOLDER / "fish iddle.mov"
 
 cap_idle = cv2.VideoCapture(str(IDLE_VIDEO_PATH))
 
+# Adjustable Video FPS Speed Control (Increase if too slow, decrease if too fast)
+TARGET_VIDEO_FPS = 45.0  
+FRAME_DELAY      = 1.0 / TARGET_VIDEO_FPS
+last_frame_time  = 0.0
+
 
 def _make_fallback_frame(text: str) -> np.ndarray:
-    """Create a dark fallback frame with centred text."""
     frame = np.zeros((H, W, 3), dtype=np.uint8)
     frame[:] = (20, 20, 20)
     cv2.putText(frame, text, (W // 2 - 260, H // 2),
@@ -94,14 +109,23 @@ else:
 
 
 def get_video_frame(cap: cv2.VideoCapture) -> np.ndarray:
-    """Read next frame from cap, looping back on end."""
-    ret, frame = cap.read()
-    if not ret:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    """Read next frame from cap, keeping timing locked to TARGET_VIDEO_FPS."""
+    global last_frame_time, current_video_frame
+    
+    current_time = time.time()
+    
+    if (current_time - last_frame_time) >= FRAME_DELAY:
         ret, frame = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
 
-    if ret:
-        return cv2.resize(frame, (W, H))
+        if ret:
+            current_video_frame = cv2.resize(frame, (W, H))
+            last_frame_time     = current_time
+
+    if current_video_frame is not None:
+        return current_video_frame
 
     fallback = np.zeros((H, W, 3), dtype=np.uint8)
     fallback[:] = (50, 20, 20)
@@ -115,17 +139,11 @@ def get_video_frame(cap: cv2.VideoCapture) -> np.ndarray:
 # ----------------------------
 
 def ask_ai_and_speak(question: str, language_name: str = "English") -> None:
-    """
-    1. Call OpenAI for an answer in the selected language.
-    2. Speak the answer using pyttsx3.
-    3. Hold talking state until speech completes.
-    """
     global current_state, interaction_text, last_word_time, conversation_history
 
     current_state    = STATE_THINKING
     interaction_text = "..."
 
-    # System prompt enforcing language and persona constraints
     system_prompt = (
         "You are a magical, ancient fish in a bowl. "
         "A human woman is standing beside you. "
@@ -142,7 +160,7 @@ def ask_ai_and_speak(question: str, language_name: str = "English") -> None:
     messages.append({"role": "user", "content": question})
 
     try:
-        client   = OpenAI(api_key=OPENAI_API_KEY)
+        client   = OpenAI(api_key=OPENAI_API_KEY, timeout=10.0)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
@@ -154,42 +172,35 @@ def ask_ai_and_speak(question: str, language_name: str = "English") -> None:
 
     interaction_text = answer
 
-    # Update conversation history
     conversation_history.append({"role": "user", "content": question})
     conversation_history.append({"role": "assistant", "content": answer})
     if len(conversation_history) > MAX_HISTORY:
         conversation_history = conversation_history[-MAX_HISTORY:]
 
-    # Estimate speech duration
+    current_state = STATE_TALKING
+    safe_answer   = answer.replace('"', '').replace("'", "")
+
     word_count        = len(answer.split())
-    words_per_minute  = 160.0
-    expected_duration = (word_count / words_per_minute) * 60.0 + 0.5
+    expected_duration = (word_count / 160.0) * 60.0 + 0.5
 
     with speech_lock:
         last_word_time = time.time()
 
-    current_state = STATE_TALKING
+    if system_os == "Linux":
+        proc = subprocess.Popen(["espeak-ng", "-s", "160", safe_answer])
+        while proc.poll() is None:
+            with speech_lock:
+                last_word_time = time.time()
+            time.sleep(0.1)
+    else:
+        tts_thread = threading.Thread(target=_speak_windows_threaded, args=(safe_answer,), daemon=True)
+        tts_thread.start()
 
-    engine = pyttsx3.init()
-    engine.setProperty("rate", int(words_per_minute))
-
-    def on_word_start(name, location, length):
-        global last_word_time
-        with speech_lock:
-            last_word_time = time.time()
-
-    engine.connect("started-word", on_word_start)
-
-    speech_start = time.time()
-    try:
-        engine.say(answer)
-        engine.runAndWait()
-    except Exception as tts_err:
-        print(f"TTS Error: {tts_err}")
-
-    elapsed = time.time() - speech_start
-    if elapsed < expected_duration:
-        time.sleep(expected_duration - elapsed)
+        start_time = time.time()
+        while tts_thread.is_alive() or (time.time() - start_time) < expected_duration:
+            with speech_lock:
+                last_word_time = time.time()
+            time.sleep(0.1)
 
     current_state    = STATE_IDLE
     interaction_text = ""
@@ -211,41 +222,30 @@ HTML_TEMPLATE = """
     <title>Interactive Exhibit</title>
     <style>
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; font-family: sans-serif; }
-        
         #video-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; pointer-events: none; z-index: 1; }
         img { width: 100%; height: 100%; object-fit: cover; }
-
         #chat-container {
             position: absolute; bottom: 30px; left: 5%; width: 90%; box-sizing: border-box;
             background: rgba(15, 15, 15, 0.75); padding: 15px; display: flex; gap: 10px; flex-direction: column;
             border: 1px solid #c9a050; border-radius: 12px;
             box-shadow: 0 10px 30px rgba(0,0,0,0.8); z-index: 9999; backdrop-filter: blur(8px);
         }
-        
         .input-row { display: flex; gap: 10px; width: 100%; box-sizing: border-box; }
-
         #language-select {
             padding: 8px; border-radius: 6px; background: rgba(0,0,0,0.8); color: #c9a050;
             border: 1px solid #c9a050; font-size: 14px; margin-bottom: 5px;
         }
-
         #question-input {
             flex: 1; padding: 15px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2);
             font-size: 16px; background: rgba(0,0,0,0.6); color: #fff;
-            resize: none; overflow-y: hidden;
-            height: 20px; 
+            resize: none; overflow-y: hidden; height: 20px;
             transition: height 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
         }
-        #question-input:focus { 
-            height: 100px; 
-            outline: none; border-color: #c9a050; 
-        }
+        #question-input:focus { height: 100px; outline: none; border-color: #c9a050; }
         #question-input::placeholder { color: #aaa; }
-
         .btn { padding: 10px; border-radius: 8px; border: none; font-weight: bold; cursor: pointer; color: #fff; text-align: center; }
         #mic-btn { background: #aa3333; font-size: 20px; flex: 0 0 60px; }
         #send-btn { background: #c9a050; font-size: 16px; flex: 1; }
-
         #rotate-message { display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: #000; color: white; z-index: 99999; flex-direction: column; justify-content: center; align-items: center; text-align: center; font-size: 26px; font-weight: bold; }
         @media screen and (orientation: portrait) { #rotate-message { display: flex; } }
     </style>
@@ -254,7 +254,6 @@ HTML_TEMPLATE = """
 <body>
     <div id="rotate-message">Please rotate your phone sideways!</div>
     <div id="video-container"><img id="stream-image" src="" alt="Connecting..."></div>
-    
     <div id="chat-container">
         <select id="language-select">
             <option value="en-US|English">English</option>
@@ -271,7 +270,6 @@ HTML_TEMPLATE = """
             <button class="btn" id="send-btn">Ask Question</button>
         </div>
     </div>
-
     <script>
         const socket   = io();
         const img      = document.getElementById('stream-image');
@@ -362,7 +360,7 @@ def handle_question(data):
 threading.Thread(
     target=lambda: socketio.run(
         app, host='0.0.0.0', port=8080,
-        ssl_context='adhoc', allow_unsafe_werkzeug=True
+        allow_unsafe_werkzeug=True
     ),
     daemon=True
 ).start()
@@ -384,7 +382,7 @@ def get_local_ip() -> str:
 
 
 LOCAL_IP   = get_local_ip()
-SERVER_URL = f"https://{LOCAL_IP}:8080"
+SERVER_URL = f"http://{LOCAL_IP}:8080"
 
 qr_pil   = qrcode.make(SERVER_URL).convert('RGB')
 qr_image = cv2.cvtColor(np.array(qr_pil), cv2.COLOR_RGB2BGR)
@@ -405,9 +403,7 @@ while True:
 
     else:  # STATE_TALKING
         if is_speech_active():
-            new_frame           = get_video_frame(cap_idle)
-            current_video_frame = new_frame.copy()
-            display_frame       = new_frame
+            display_frame = get_video_frame(cap_idle)
         else:
             if current_video_frame is None:
                 current_video_frame = get_video_frame(cap_idle)
@@ -415,12 +411,10 @@ while True:
 
     local_frame = display_frame.copy()
 
-    # Show QR code after 20 seconds idle
     if (current_time - last_interaction_time) > 20:
         display_frame[20:170, 20:170] = qr_image
         local_frame[20:170, 20:170]   = qr_image
 
-    # Stream frame to connected mobile clients
     if current_time - last_emit_time > (1.0 / STREAM_FPS):
         small_display  = cv2.resize(display_frame, (640, 360))
         _, img_encoded = cv2.imencode('.jpg', small_display, [cv2.IMWRITE_JPEG_QUALITY, 55])
@@ -428,11 +422,9 @@ while True:
         socketio.emit('update_image', {'image': f'data:image/jpeg;base64,{img_base64}'})
         last_emit_time = current_time
 
-    # Local Monitor Display
     cv2.imshow("Interactive Exhibit", local_frame)
-    if cv2.waitKey(1) & 0xFF == 27:   # ESC to quit
+    if cv2.waitKey(1) & 0xFF == 27:
         break
 
-# Cleanup
 cap_idle.release()
 cv2.destroyAllWindows()
